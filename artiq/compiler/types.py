@@ -594,6 +594,9 @@ def is_c_function(typ, name=None):
         return isinstance(typ, TCFunction) and \
             typ.name == name
 
+def is_python_function(typ):
+    return typ.find().__class__ == TFunction
+
 def is_builtin(typ, name=None):
     typ = typ.find()
     if name is None:

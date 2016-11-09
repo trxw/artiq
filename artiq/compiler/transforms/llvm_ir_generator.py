@@ -135,6 +135,7 @@ class LLVMIRGenerator:
         self.llfunction = None
         self.llmap = {}
         self.llobject_map = {}
+        self.llnowptr = None
         self.phis = []
         self.debug_info_emitter = DebugInfoEmitter(self.llmodule)
         self.empty_metadata = self.llmodule.add_metadata([])
@@ -145,10 +146,6 @@ class LLVMIRGenerator:
             ll.MetaDataString(self.llmodule, "ref-only function call"),
             self.tbaa_tree,
             ll.Constant(lli64, 1)
-        ])
-        self.tbaa_now = self.llmodule.add_metadata([
-            ll.MetaDataString(self.llmodule, "timeline position"),
-            self.tbaa_tree
         ])
 
     def needs_sret(self, lltyp, may_be_large=True):
@@ -183,14 +180,20 @@ class LLVMIRGenerator:
         elif types._is_pointer(typ):
             return llptr
         elif types.is_function(typ):
-            sretarg = []
             llretty = self.llty_of_type(typ.ret, for_return=True)
             if self.needs_sret(llretty):
                 sretarg = [llretty.as_pointer()]
-                llretty = llvoid
+                llretty = lli64
+            elif llretty != llvoid:
+                sretarg = []
+                llretty = ll.LiteralStructType([lli64, llretty])
+            else:
+                sretarg = []
+                llretty = lli64
 
             envarg = llptr
-            llty = ll.FunctionType(args=sretarg + [envarg] +
+            nowarg = lli64
+            llty = ll.FunctionType(args=sretarg + [nowarg, envarg] +
                                         [self.llty_of_type(typ.args[arg])
                                          for arg in typ.args] +
                                         [self.llty_of_type(ir.TOption(typ.optargs[arg]))
@@ -354,8 +357,6 @@ class LLVMIRGenerator:
             llty = ll.FunctionType(llvoid, [lli32, llptr, llptrptr])
         elif name == "recv_rpc":
             llty = ll.FunctionType(lli32, [llptr])
-        elif name == "now":
-            llty = lli64
         elif name == "watchdog_set":
             llty = ll.FunctionType(lli32, [lli64])
         elif name == "watchdog_clear":
@@ -381,9 +382,7 @@ class LLVMIRGenerator:
         if llfun is None:
             llfunty = self.llty_of_type(typ, bare=True)
             llfun   = ll.Function(self.llmodule, llfunty, name)
-
-            llretty = self.llty_of_type(typ.find().ret, for_return=True)
-            if self.needs_sret(llretty):
+            if self.has_sret(typ):
                 llfun.args[0].add_attribute('sret')
         return llfun
 
@@ -532,6 +531,10 @@ class LLVMIRGenerator:
             if func.is_cold:
                 self.llfunction.attributes.add('cold')
                 self.llfunction.attributes.add('noinline')
+            if 'inline' in func.flags:
+                self.llfunction.attributes.add('inlinehint')
+            if 'always_inline' in func.flags:
+                self.llfunction.attributes.add('alwaysinline')
 
             self.llfunction.attributes.add('uwtable')
             self.llfunction.attributes.personality = self.llbuiltin("__artiq_personality")
@@ -545,20 +548,28 @@ class LLVMIRGenerator:
 
             # First, map arguments.
             if self.has_sret(func.type):
-                llactualargs = self.llfunction.args[1:]
+                llactualargs = self.llfunction.args[2:]
+                llnow = self.llfunction.args[1]
             else:
-                llactualargs = self.llfunction.args
+                llactualargs = self.llfunction.args[1:]
+                llnow = self.llfunction.args[0]
 
             for arg, llarg in zip(func.arguments, llactualargs):
                 llarg.name = arg.name
                 self.llmap[arg] = llarg
 
-            # Second, create all basic blocks.
+            # Second, set up a pre-entry block.
+            llpreentry = self.llfunction.append_basic_block("preentry")
+            self.llbuilder.position_at_end(llpreentry)
+            self.llnowptr = self.llbuilder.alloca(lli64, name="now")
+            self.llbuilder.store(llnow, self.llnowptr)
+
+            # Third, create all basic blocks.
             for block in func.basic_blocks:
                 llblock = self.llfunction.append_basic_block(block.name)
                 self.llmap[block] = llblock
 
-            # Third, translate all instructions.
+            # Fourth, translate all instructions.
             for block in func.basic_blocks:
                 self.llbuilder.position_at_end(self.llmap[block])
                 for insn in block.instructions:
@@ -577,7 +588,11 @@ class LLVMIRGenerator:
                 # using a different map (the following one).
                 llblock_map[block] = self.llbuilder.basic_block
 
-            # Fourth, add incoming values to phis.
+            # Fifth, branch from pre-entry block to the real entry block.
+            self.llbuilder.position_at_end(llpreentry)
+            self.llbuilder.branch(self.llmap[func.entry()])
+
+            # Sixth, add incoming values to phis.
             for phi, llphi in self.phis:
                 for value, block in phi.incoming():
                     llphi.add_incoming(self.map(value), llblock_map[block])
@@ -1074,20 +1089,16 @@ class LLVMIRGenerator:
             # This is an identity cast at LLVM IR level.
             return self.map(insn.operands[0])
         elif insn.op == "now_mu":
-            llnow = self.llbuilder.load(self.llbuiltin("now"), name=insn.name)
-            llnow.set_metadata("tbaa", self.tbaa_now)
+            llnow = self.llbuilder.load(self.llnowptr, name=insn.name)
             return llnow
         elif insn.op == "at_mu":
             time, = insn.operands
-            return self.llbuilder.store(self.map(time), self.llbuiltin("now"))
+            return self.llbuilder.store(self.map(time), self.llnowptr)
         elif insn.op == "delay_mu":
             interval, = insn.operands
-            llnowptr = self.llbuiltin("now")
-            llnow = self.llbuilder.load(llnowptr, name="now.old")
-            llnow.set_metadata("tbaa", self.tbaa_now)
+            llnow = self.llbuilder.load(self.llnowptr, name="now.old")
             lladjusted = self.llbuilder.add(llnow, self.map(interval), name="now.new")
-            llnowstore = self.llbuilder.store(lladjusted, llnowptr)
-            llnowstore.set_metadata("tbaa", self.tbaa_now)
+            llnowstore = self.llbuilder.store(lladjusted, self.llnowptr)
             return llnowstore
         elif insn.op == "watchdog_set":
             interval, = insn.operands
@@ -1118,8 +1129,9 @@ class LLVMIRGenerator:
             llfun = self.llbuilder.extract_value(llclosure, 1, name=name)
         else:
             llfun = self.map(insn.static_target_function)
+        llnow     = self.llbuilder.load(self.llnowptr)
         llenv     = self.llbuilder.extract_value(llclosure, 0, name="env.fun")
-        return llfun, [llenv] + list(llargs)
+        return llfun, [llnow, llenv] + list(llargs)
 
     def _prepare_ffi_call(self, insn):
         llargs = []
@@ -1155,6 +1167,16 @@ class LLVMIRGenerator:
                 llfun.attributes.add('nounwind')
 
         return llfun, list(llargs)
+
+    def _process_closure_result(self, functionty, llresult):
+        if builtins.is_none(functionty.ret):
+            assert llresult.type == lli64
+            return self.llbuilder.store(llresult, self.llnowptr)
+        else:
+            llnow   = self.llbuilder.extract_value(llresult, 0)
+            llvalue = self.llbuilder.extract_value(llresult, 1)
+            self.llbuilder.store(llnow, self.llnowptr)
+            return llvalue
 
     # See session.c:{send,receive}_rpc_value and comm_generic.py:_{send,receive}_rpc_value.
     def _rpc_tag(self, typ, error_handler):
@@ -1340,11 +1362,14 @@ class LLVMIRGenerator:
             if types.is_c_function(functiontyp) and 'nowrite' in functiontyp.flags:
                 llcall.set_metadata('tbaa', self.tbaa_nowrite_call)
 
+        if types.is_python_function(functiontyp):
+            llresult = self._process_closure_result(functiontyp, llresult)
+
         return llresult
 
     def process_Invoke(self, insn):
         functiontyp = insn.target_function().type
-        llnormalblock = self.map(insn.normal_target())
+        llnormalblock = self.llfunction.append_basic_block("invoke.post")
         llunwindblock = self.map(insn.exception_target())
         if types.is_rpc(functiontyp):
             return self._build_rpc(insn.target_function().loc,
@@ -1366,14 +1391,19 @@ class LLVMIRGenerator:
 
             self.llbuilder.call(self.llbuiltin("llvm.stackrestore"), [llstackptr])
         else:
-            llcall = self.llbuilder.invoke(llfun, llargs, llnormalblock, llunwindblock,
-                                           name=insn.name)
+            llcall = llresult = self.llbuilder.invoke(llfun, llargs, llnormalblock, llunwindblock,
+                                                      name=insn.name)
 
             # See the comment in process_Call.
             if types.is_c_function(functiontyp) and 'nowrite' in functiontyp.flags:
                 llcall.set_metadata('tbaa', self.tbaa_nowrite_call)
 
-        return llcall
+        self.llbuilder.position_at_end(llnormalblock)
+        if types.is_python_function(functiontyp):
+            llresult = self._process_closure_result(functiontyp, llresult)
+        self.llbuilder.branch(self.map(insn.normal_target()))
+
+        return llresult
 
     def _quote(self, value, typ, path):
         value_id = id(value)
@@ -1497,15 +1527,19 @@ class LLVMIRGenerator:
         return llinsn
 
     def process_Return(self, insn):
+        llnow = self.llbuilder.load(self.llnowptr)
         if builtins.is_none(insn.value().type):
-            return self.llbuilder.ret_void()
+            return self.llbuilder.ret(llnow)
         else:
             llvalue = self.map(insn.value())
             if self.needs_sret(llvalue.type):
                 self.llbuilder.store(llvalue, self.llfunction.args[0])
-                return self.llbuilder.ret_void()
+                return self.llbuilder.ret(llnow)
             else:
-                return self.llbuilder.ret(llvalue)
+                llret = ll.Constant(self.llfunction.ftype.return_type, ll.Undefined)
+                llret = self.llbuilder.insert_value(llret, llnow,  0)
+                llret = self.llbuilder.insert_value(llret, llvalue,  1)
+                return self.llbuilder.ret(llret)
 
     def process_Unreachable(self, insn):
         return self.llbuilder.unreachable()
