@@ -96,6 +96,7 @@ mod analyzer;
 include!(concat!(env!("OUT_DIR"), "/git_info.rs"));
 
 fn startup() {
+    board::uart::set_speed(921600);
     board::clock::init();
     info!("booting ARTIQ");
     info!("software version {}", GIT_COMMIT);
