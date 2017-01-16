@@ -3,7 +3,7 @@ include $(MISOC_DIRECTORY)/software/common.mak
 
 PYTHON ?= python3.5
 
-OBJECTS := flash_storage.o main.o
+OBJECTS := flash_storage.o
 OBJECTS_KSUPPORT := ksupport_glue.o artiq_personality.o
 
 RUSTOUT := cargo/or1k-unknown-none/debug
@@ -15,7 +15,6 @@ CFLAGS += \
 	-I$(LIBDYLD_DIRECTORY)/include \
 	-I$(LIBUNWIND_DIRECTORY) \
 	-I$(LIBUNWIND_DIRECTORY)/../unwinder/include \
-	-I$(LIBLWIP_DIRECTORY)/../lwip/src/include \
 	-I$(LIBLWIP_DIRECTORY)
 CFLAGS += -DNDEBUG
 
@@ -25,8 +24,7 @@ LDFLAGS += --gc-sections \
 	-L../libm \
 	-L../liballoc \
 	-L../libunwind \
-	-L../libdyld \
-	-L../liblwip
+	-L../libdyld
 
 all: runtime.bin runtime.fbi
 
@@ -42,7 +40,7 @@ runtime.elf: $(OBJECTS) $(RUSTOUT)/libruntime.a
 		-T $(RUNTIME_DIRECTORY)/runtime.ld \
 		-o $@ \
 		$^ \
-		-lbase-nofloat -lcompiler-rt -lalloc -llwip
+		-lbase-nofloat -lcompiler-rt -lalloc
 	@chmod -x $@
 
 .PHONY: $(RUSTOUT_KSUPPORT)/libksupport.a
